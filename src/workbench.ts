@@ -1,6 +1,18 @@
-import { LitElement, css, html, nothing, type TemplateResult } from 'lit';
+import { LitElement, css, html, nothing, type PropertyValues, type TemplateResult } from 'lit';
 import { repeat } from 'lit/directives/repeat.js';
 import { diffAgainstSnapshot } from './diff';
+import {
+  DEFAULT_SHORTCUTS,
+  SHORTCUT_ACTIONS,
+  comboFromEvent,
+  formatCombo,
+  loadShortcuts,
+  persistShortcuts,
+  validateCombo,
+  type ShortcutActionId,
+  type ShortcutActionMeta,
+  type ShortcutMap
+} from './shortcuts';
 import { SpecStore } from './store';
 import type { ComponentExample, ComponentSpec, PreviewDensity, PreviewTheme, PropertySpec, ValidationIssue } from './types';
 
@@ -13,7 +25,12 @@ export class SpecA11yWorkbench extends LitElement {
     previewTheme: { state: true },
     previewDensity: { state: true },
     toast: { state: true },
-    showValidation: { state: true }
+    showValidation: { state: true },
+    shortcuts: { state: true },
+    shortcutDialogOpen: { state: true },
+    shortcutDraft: { state: true },
+    recordingAction: { state: true },
+    shortcutError: { state: true }
   };
 
   private store = new SpecStore();
@@ -24,6 +41,11 @@ export class SpecA11yWorkbench extends LitElement {
   private toast = '';
   private showValidation = true;
   private toastTimer?: number;
+  private shortcuts: ShortcutMap = loadShortcuts();
+  private shortcutDialogOpen = false;
+  private shortcutDraft: ShortcutMap = { ...this.shortcuts };
+  private recordingAction: ShortcutActionId | null = null;
+  private shortcutError = '';
 
   static styles = css`
     :host {
@@ -116,6 +138,23 @@ export class SpecA11yWorkbench extends LitElement {
     .search-empty { padding: 20px 8px; color: var(--spectrum-gray-700); font-size: 13px; }
     .footer-hint { position: fixed; bottom: 10px; left: 50%; transform: translateX(-50%); z-index: 30; background: #202020; color: white; border-radius: 999px; padding: 6px 12px; font-size: 11px; opacity: .9; }
     sp-toast { position: fixed; right: 18px; bottom: 18px; z-index: 50; }
+    .shortcut-overlay { position: fixed; inset: 0; z-index: 60; display: grid; place-items: center; padding: 20px; background: rgb(15 23 42 / .5); }
+    .shortcut-dialog { width: min(580px, 100%); max-height: 86vh; overflow: auto; display: grid; gap: 12px; align-content: start; background: var(--spectrum-gray-50); border-radius: 16px; padding: 20px; box-shadow: 0 24px 70px rgb(0 0 0 / .35); outline: none; }
+    .shortcut-head { display: flex; align-items: center; justify-content: space-between; }
+    .shortcut-head h2 { margin: 0; font-size: 17px; }
+    .shortcut-tip { margin: 0; color: var(--spectrum-gray-700); font-size: 12px; line-height: 1.6; }
+    .shortcut-list { display: grid; gap: 7px; }
+    .shortcut-row { display: flex; align-items: center; gap: 6px; }
+    .shortcut-main { flex: 1; min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 10px; border: 1px solid var(--spectrum-gray-300); border-radius: 10px; background: var(--spectrum-gray-75, var(--spectrum-gray-100)); padding: 9px 12px; color: inherit; font: inherit; cursor: pointer; text-align: left; }
+    .shortcut-main:hover { border-color: var(--spectrum-blue-600); }
+    .shortcut-row.recording .shortcut-main { border-color: var(--spectrum-blue-700); outline: 3px solid var(--spectrum-blue-400); }
+    .shortcut-label { font-size: 13px; }
+    .shortcut-combo { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; background: var(--spectrum-gray-200); border-radius: 6px; padding: 3px 9px; white-space: nowrap; }
+    .shortcut-row.recording .shortcut-combo { background: var(--spectrum-blue-200); color: var(--spectrum-blue-900, #00306b); }
+    .shortcut-reset { border: 0; background: transparent; color: var(--spectrum-blue-800, #1463a8); font-size: 12px; text-decoration: underline; cursor: pointer; padding: 4px 6px; white-space: nowrap; }
+    .shortcut-error { border-left: 4px solid var(--spectrum-red-600); border-radius: 8px; background: var(--spectrum-gray-100); padding: 10px 11px; font-size: 12px; color: var(--spectrum-red-800, #8f1d1d); }
+    .shortcut-foot { display: flex; align-items: center; gap: 8px; }
+    .shortcut-spacer { flex: 1; }
     @media (max-width: 1180px) {
       .layout { grid-template-columns: 230px minmax(0, 1fr); }
       .inspector { grid-column: 1 / -1; border-left: 0; border-top: 1px solid var(--spectrum-gray-300); grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -140,44 +179,93 @@ export class SpecA11yWorkbench extends LitElement {
     super.connectedCallback();
     this.store.addEventListener('change', this.onStoreChange);
     window.addEventListener('keydown', this.onKeyDown);
+    window.addEventListener('keydown', this.onDialogKeyDown, true);
   }
 
   disconnectedCallback() {
     this.store.removeEventListener('change', this.onStoreChange);
     window.removeEventListener('keydown', this.onKeyDown);
+    window.removeEventListener('keydown', this.onDialogKeyDown, true);
   }
 
   private onStoreChange = () => {
     this.requestUpdate();
   };
 
+  // 设置面板打开期间，原有快捷键一律不响应；面板自己的 onDialogKeyDown 接管按键。
   private onKeyDown = (event: KeyboardEvent) => {
+    if (this.shortcutDialogOpen) return;
     const modifier = event.metaKey || event.ctrlKey;
     if (modifier && event.key.toLowerCase() === 'z') {
       event.preventDefault();
       event.shiftKey ? this.store.redo() : this.store.undo();
       return;
     }
-    if (modifier && event.key.toLowerCase() === 's') {
-      event.preventDefault();
+    const combo = comboFromEvent(event);
+    if (!combo) return;
+    // 无 ⌘/Ctrl/Alt 的组合（比如单键）在输入框、文本域等可编辑元素里不触发，保证打字不被劫持。
+    if (!event.metaKey && !event.ctrlKey && !event.altKey && this.isEditableTarget(event)) return;
+    const action = SHORTCUT_ACTIONS.find((item) => this.shortcuts[item.id] === combo)?.id;
+    if (!action) return;
+    event.preventDefault();
+    this.runShortcutAction(action);
+  };
+
+  private runShortcutAction(action: ShortcutActionId) {
+    if (action === 'search') {
+      this.renderRoot.querySelector<HTMLElement>('sp-search')?.focus();
+      return;
+    }
+    if (action === 'new-component') {
+      this.store.addComponent();
+      return;
+    }
+    if (action === 'save-version') {
       this.store.createSnapshot('键盘保存');
       this.flash('已创建版本快照');
       return;
     }
-    if (modifier && event.key.toLowerCase() === 'k') {
-      event.preventDefault();
-      this.renderRoot.querySelector<HTMLElement>('sp-search')?.focus();
+    this.tab = action.replace('tab-', '') as EditorTab;
+  }
+
+  private isEditableTarget(event: KeyboardEvent): boolean {
+    return event.composedPath().some((node) => {
+      if (!(node instanceof HTMLElement)) return false;
+      if (node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement || node instanceof HTMLSelectElement) return true;
+      if (node.isContentEditable) return true;
+      const tag = node.tagName.toLowerCase();
+      return tag === 'sp-search' || tag === 'sp-textfield' || tag === 'sp-picker';
+    });
+  }
+
+  // 设置面板内的按键：录入新组合，或用 Esc 取消录入 / 关闭面板。
+  private onDialogKeyDown = (event: KeyboardEvent) => {
+    if (!this.shortcutDialogOpen) return;
+    if (!this.recordingAction) {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        this.closeShortcutSettings();
+      }
+      return; // 其余按键（含 Tab 焦点移动）保持浏览器默认行为
+    }
+    // 录入中接管全部按键，避免旧快捷键或浏览器默认动作触发
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.key === 'Escape') {
+      this.recordingAction = null;
+      this.shortcutError = '';
       return;
     }
-    if (event.altKey && event.key.toLowerCase() === 'n') {
-      event.preventDefault();
-      this.store.addComponent();
-      return;
-    }
-    const tabMap: Record<string, EditorTab> = { '1': 'overview', '2': 'api', '3': 'accessibility', '4': 'examples', '5': 'history' };
-    if (event.altKey && tabMap[event.key]) {
-      event.preventDefault();
-      this.tab = tabMap[event.key];
+    const combo = comboFromEvent(event);
+    if (!combo) return; // 只按了修饰键，继续等待
+    const conflict = validateCombo(combo, this.recordingAction, this.shortcutDraft);
+    if (conflict) {
+      this.shortcutError = conflict.message;
+    } else {
+      this.shortcutDraft = { ...this.shortcutDraft, [this.recordingAction]: combo };
+      this.recordingAction = null;
+      this.shortcutError = '';
     }
   };
 
@@ -204,6 +292,7 @@ export class SpecA11yWorkbench extends LitElement {
               <sp-button variant="secondary" ?disabled=${!this.store.canUndo} @click=${() => this.store.undo()}>撤销</sp-button>
               <sp-button variant="secondary" ?disabled=${!this.store.canRedo} @click=${() => this.store.redo()}>重做</sp-button>
               <sp-button variant="accent" @click=${() => { this.store.createSnapshot('工具栏保存'); this.flash('版本已保存'); }}>保存版本</sp-button>
+              <sp-action-button size="m" label="快捷键设置" @click=${this.openShortcutSettings}>快捷键</sp-action-button>
               <span class="save-state">本地自动保存 · ${selected?.revision ?? 0} 版</span>
             </div>
           </header>
@@ -232,7 +321,8 @@ export class SpecA11yWorkbench extends LitElement {
             </aside>
           </div>
           ${this.toast ? html`<sp-toast open variant="positive" timeout="3000">${this.toast}</sp-toast>` : nothing}
-          <div class="footer-hint">⌘/Ctrl+Z 撤销 · ⇧⌘/Ctrl+Z 重做 · ⌘/Ctrl+K 搜索 · Alt+1–5 切换面板</div>
+          <div class="footer-hint">⌘/Ctrl+Z 撤销 · ${formatCombo(this.shortcuts.search)} 搜索 · ${formatCombo(this.shortcuts['new-component'])} 新建 · ${formatCombo(this.shortcuts['save-version'])} 保存版本 · 工具栏「快捷键」可自定义键位</div>
+          ${this.shortcutDialogOpen ? this.renderShortcutSettings() : nothing}
         </div>
       </sp-theme>
     `;
@@ -437,6 +527,47 @@ export class SpecA11yWorkbench extends LitElement {
     `;
   }
 
+  private renderShortcutSettings(): TemplateResult {
+    return html`
+      <div class="shortcut-overlay" @click=${(event: Event) => { if (event.target === event.currentTarget) this.closeShortcutSettings(); }}>
+        <div class="shortcut-dialog" role="dialog" aria-modal="true" aria-label="快捷键设置" tabindex="-1">
+          <div class="shortcut-head">
+            <h2>快捷键设置</h2>
+            <sp-action-button size="s" label="关闭设置" @click=${this.closeShortcutSettings}>✕</sp-action-button>
+          </div>
+          <p class="shortcut-tip">点击某一项后按下新的组合键即可更换；按 Esc 取消录入。与浏览器或其他动作冲突时会保留原设置。保存后立即生效并保存在本机。</p>
+          <div class="shortcut-list">
+            ${SHORTCUT_ACTIONS.map((action) => this.renderShortcutRow(action))}
+          </div>
+          ${this.shortcutError ? html`<div class="shortcut-error" role="alert">${this.shortcutError}</div>` : nothing}
+          <div class="shortcut-foot">
+            <sp-button variant="secondary" @click=${this.resetAllShortcuts}>全部恢复默认</sp-button>
+            <span class="shortcut-spacer"></span>
+            <sp-button variant="secondary" @click=${this.closeShortcutSettings}>取消</sp-button>
+            <sp-button variant="accent" @click=${this.saveShortcutSettings}>保存设置</sp-button>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  private renderShortcutRow(action: ShortcutActionMeta): TemplateResult {
+    const recording = this.recordingAction === action.id;
+    const combo = this.shortcutDraft[action.id];
+    const modified = combo !== DEFAULT_SHORTCUTS[action.id];
+    return html`
+      <div class="shortcut-row ${recording ? 'recording' : ''}">
+        <button type="button" class="shortcut-main" aria-pressed=${recording} @click=${() => this.startRecording(action.id)}>
+          <span class="shortcut-label">${action.label}</span>
+          <kbd class="shortcut-combo">${recording ? `录入中… Esc 取消（当前 ${formatCombo(combo)}）` : formatCombo(combo)}</kbd>
+        </button>
+        ${modified && !recording
+          ? html`<button type="button" class="shortcut-reset" @click=${() => this.resetShortcut(action.id)}>恢复默认</button>`
+          : nothing}
+      </div>
+    `;
+  }
+
   private get filteredComponents(): ComponentSpec[] {
     const query = this.query.trim().toLowerCase();
     if (!query) return this.store.state.components;
@@ -450,6 +581,56 @@ export class SpecA11yWorkbench extends LitElement {
   private statusLabel(status: ComponentSpec['status']): string {
     return { draft: '草稿', review: '待审', published: '已发布' }[status];
   }
+
+  protected updated(changed: PropertyValues) {
+    if (changed.has('shortcutDialogOpen') && this.shortcutDialogOpen) {
+      this.renderRoot.querySelector<HTMLElement>('.shortcut-dialog')?.focus();
+    }
+  }
+
+  private openShortcutSettings = () => {
+    this.shortcutDraft = { ...this.shortcuts };
+    this.recordingAction = null;
+    this.shortcutError = '';
+    this.shortcutDialogOpen = true;
+  };
+
+  private closeShortcutSettings = () => {
+    this.shortcutDialogOpen = false;
+    this.recordingAction = null;
+    this.shortcutError = '';
+  };
+
+  private saveShortcutSettings = () => {
+    this.shortcuts = { ...this.shortcutDraft };
+    persistShortcuts(this.shortcuts);
+    this.shortcutDialogOpen = false;
+    this.recordingAction = null;
+    this.shortcutError = '';
+    this.flash('快捷键已保存并立即生效');
+  };
+
+  private startRecording = (action: ShortcutActionId) => {
+    this.shortcutError = '';
+    this.recordingAction = this.recordingAction === action ? null : action;
+  };
+
+  private resetShortcut = (action: ShortcutActionId) => {
+    const defaultCombo = DEFAULT_SHORTCUTS[action];
+    const holder = SHORTCUT_ACTIONS.find((item) => item.id !== action && this.shortcutDraft[item.id] === defaultCombo);
+    if (holder) {
+      this.shortcutError = `默认组合「${formatCombo(defaultCombo)}」目前被「${holder.label}」占用，请先调整该项，再恢复默认。`;
+      return;
+    }
+    this.shortcutDraft = { ...this.shortcutDraft, [action]: defaultCombo };
+    this.shortcutError = '';
+  };
+
+  private resetAllShortcuts = () => {
+    this.shortcutDraft = { ...DEFAULT_SHORTCUTS };
+    this.recordingAction = null;
+    this.shortcutError = '';
+  };
 
   private async copy(value: string) {
     try {
