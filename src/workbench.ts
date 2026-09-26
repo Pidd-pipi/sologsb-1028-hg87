@@ -2,9 +2,55 @@ import { LitElement, css, html, nothing, type TemplateResult } from 'lit';
 import { repeat } from 'lit/directives/repeat.js';
 import { diffAgainstSnapshot } from './diff';
 import { SpecStore } from './store';
+import {
+  SHORTCUT_DESCRIPTORS,
+  actionLabel,
+  ariaShortcut,
+  bindingFromEvent,
+  bindingProblem,
+  describeBinding,
+  eventMatchesBinding,
+  findConflict,
+  loadShortcuts,
+  sameBinding,
+  saveShortcuts,
+  type ShortcutAction,
+  type ShortcutBinding,
+  type ShortcutMap
+} from './shortcuts';
 import type { ComponentExample, ComponentSpec, PreviewDensity, PreviewTheme, PropertySpec, ValidationIssue } from './types';
 
 type EditorTab = 'overview' | 'api' | 'accessibility' | 'examples' | 'history';
+
+interface RowError {
+  message: string;
+  kind: 'invalid' | 'conflict';
+  // 冲突提示里被拒绝的新组合：草稿里仍是原绑定，需记住它才能判断提示是否还成立。
+  rejected?: ShortcutBinding;
+}
+
+const TAB_ACTIONS = ['tabOverview', 'tabApi', 'tabAccessibility', 'tabExamples', 'tabHistory'] as const satisfies readonly ShortcutAction[];
+const TAB_BY_ACTION: Record<(typeof TAB_ACTIONS)[number], EditorTab> = {
+  tabOverview: 'overview',
+  tabApi: 'api',
+  tabAccessibility: 'accessibility',
+  tabExamples: 'examples',
+  tabHistory: 'history'
+};
+
+/** 焦点位于可编辑元素内时，除“保存版本”外不触发全局快捷键，避免劫持打字。 */
+function isEditableTarget(target: EventTarget | null): boolean {
+  const element = target as HTMLElement | null;
+  if (!element) return false;
+  if (element.isContentEditable) return true;
+  const tag = element.tagName;
+  if (tag === 'TEXTAREA' || tag === 'SELECT') return true;
+  if (tag === 'INPUT') {
+    const type = (element as HTMLInputElement).type.toLowerCase();
+    return type !== 'checkbox' && type !== 'radio' && type !== 'button' && type !== 'submit';
+  }
+  return false;
+}
 
 export class SpecA11yWorkbench extends LitElement {
   static properties = {
@@ -13,7 +59,10 @@ export class SpecA11yWorkbench extends LitElement {
     previewTheme: { state: true },
     previewDensity: { state: true },
     toast: { state: true },
-    showValidation: { state: true }
+    showValidation: { state: true },
+    shortcutsOpen: { state: true },
+    recordingAction: { state: true },
+    draftVersion: { state: true }
   };
 
   private store = new SpecStore();
@@ -24,6 +73,14 @@ export class SpecA11yWorkbench extends LitElement {
   private toast = '';
   private showValidation = true;
   private toastTimer?: number;
+  private shortcuts: ShortcutMap = loadShortcuts();
+  // 设置对话框状态：打开期间所有旧快捷键停止工作。
+  private shortcutsOpen = false;
+  private recordingAction: ShortcutAction | null = null;
+  private draft: ShortcutMap = this.shortcuts;
+  private draftVersion = 0; // 自增以触发设置列表重渲染
+  private rowError = new Map<ShortcutAction, RowError>();
+  private lastFocusedElement: HTMLElement | null = null;
 
   static styles = css`
     :host {
@@ -116,6 +173,66 @@ export class SpecA11yWorkbench extends LitElement {
     .search-empty { padding: 20px 8px; color: var(--spectrum-gray-700); font-size: 13px; }
     .footer-hint { position: fixed; bottom: 10px; left: 50%; transform: translateX(-50%); z-index: 30; background: #202020; color: white; border-radius: 999px; padding: 6px 12px; font-size: 11px; opacity: .9; }
     sp-toast { position: fixed; right: 18px; bottom: 18px; z-index: 50; }
+    .tab kbd {
+      display: inline-block; margin-left: 7px; padding: 1px 6px; border-radius: 5px;
+      background: var(--spectrum-gray-200); border: 1px solid var(--spectrum-gray-400);
+      font-family: inherit; font-size: 10px; font-weight: 600; color: var(--spectrum-gray-700);
+    }
+    .tab[aria-selected='true'] kbd { background: var(--spectrum-gray-100); color: var(--spectrum-gray-800); }
+    .shortcut-overlay {
+      position: fixed; inset: 0; z-index: 100; display: grid; place-items: center;
+      background: rgb(15 23 42 / .55); padding: 20px; backdrop-filter: blur(2px);
+    }
+    .shortcut-dialog {
+      width: min(680px, 100%); max-height: 86vh; overflow: auto; display: grid; gap: 8px;
+      background: var(--spectrum-gray-50); color: var(--spectrum-gray-900);
+      border: 1px solid var(--spectrum-gray-300); border-radius: 16px; padding: 22px;
+      box-shadow: 0 24px 70px rgb(0 0 0 / .35);
+    }
+    .shortcut-dialog-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 6px; }
+    .shortcut-dialog-head h2 { margin: 0; font-size: 19px; }
+    .shortcut-dialog-head p { margin: 6px 0 0; font-size: 12px; color: var(--spectrum-gray-700); line-height: 1.55; }
+    .icon-btn {
+      border: 0; background: transparent; font-size: 22px; line-height: 1; cursor: pointer;
+      color: var(--spectrum-gray-700); padding: 4px 10px; border-radius: 8px;
+    }
+    .icon-btn:hover { background: var(--spectrum-gray-200); }
+    .shortcut-group-title {
+      font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em;
+      color: var(--spectrum-gray-600); margin: 12px 0 2px;
+    }
+    .shortcut-row {
+      display: flex; align-items: center; gap: 12px; padding: 10px 12px;
+      border: 1px solid var(--spectrum-gray-300); border-radius: 10px; background: #fff;
+    }
+    .shortcut-row.recording { border-color: var(--spectrum-blue-600); box-shadow: 0 0 0 3px var(--spectrum-blue-400); }
+    .shortcut-name { font-size: 13px; font-weight: 600; min-width: 150px; }
+    .shortcut-error { flex: 1; color: var(--spectrum-red-700, #b52b27); font-size: 12px; line-height: 1.4; }
+    .shortcut-row-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+    .shortcut-key {
+      min-width: 168px; text-align: center; border: 1px solid var(--spectrum-gray-500);
+      border-radius: 8px; background: var(--spectrum-gray-100); color: var(--spectrum-gray-900);
+      padding: 7px 12px; font: inherit; font-size: 12px; font-weight: 600; cursor: pointer;
+    }
+    .shortcut-key[aria-pressed='true'] {
+      background: var(--spectrum-blue-200); border-color: var(--spectrum-blue-700); color: #0a3d7a;
+      animation: shortcut-pulse 1.4s ease-in-out infinite;
+    }
+    @keyframes shortcut-pulse { 50% { box-shadow: 0 0 0 4px rgb(20 115 230 / .25); } }
+    .btn-link {
+      border: 0; background: transparent; color: var(--spectrum-blue-800); cursor: pointer;
+      font: inherit; font-size: 12px; text-decoration: underline; padding: 4px;
+    }
+    .btn-link:disabled { color: var(--spectrum-gray-500); cursor: not-allowed; text-decoration: none; }
+    .shortcut-dialog-foot { display: flex; align-items: center; gap: 8px; margin-top: 16px; }
+    .shortcut-spacer { flex: 1; }
+    .btn-primary, .btn-secondary {
+      border-radius: 8px; padding: 8px 16px; font: inherit; font-size: 13px; cursor: pointer;
+    }
+    .btn-primary { border: 1px solid var(--spectrum-blue-700); background: var(--spectrum-blue-600); color: #fff; }
+    .btn-primary:disabled { opacity: .5; cursor: not-allowed; }
+    .btn-secondary { border: 1px solid var(--spectrum-gray-500); background: #fff; color: var(--spectrum-gray-900); }
+    .btn-secondary:disabled { opacity: .5; cursor: not-allowed; }
     @media (max-width: 1180px) {
       .layout { grid-template-columns: 230px minmax(0, 1fr); }
       .inspector { grid-column: 1 / -1; border-left: 0; border-top: 1px solid var(--spectrum-gray-300); grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -140,46 +257,215 @@ export class SpecA11yWorkbench extends LitElement {
     super.connectedCallback();
     this.store.addEventListener('change', this.onStoreChange);
     window.addEventListener('keydown', this.onKeyDown);
+    // 捕获阶段先拿到按键：录制组合键时拦截浏览器默认行为，且不触发旧快捷键。
+    window.addEventListener('keydown', this.onCaptureKeyDown, true);
   }
 
   disconnectedCallback() {
     this.store.removeEventListener('change', this.onStoreChange);
     window.removeEventListener('keydown', this.onKeyDown);
+    window.removeEventListener('keydown', this.onCaptureKeyDown, true);
   }
 
   private onStoreChange = () => {
     this.requestUpdate();
   };
 
+  /** 设置对话框打开期间吞掉全部应用快捷键，并处理录制与焦点约束。 */
+  private onCaptureKeyDown = (event: KeyboardEvent) => {
+    if (!this.shortcutsOpen) return;
+    if (this.recordingAction) {
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.key === 'Escape') {
+        this.recordingAction = null;
+      } else {
+        this.captureBinding(event);
+      }
+      return;
+    }
+    // 设置期间旧快捷键一律不抢按键（含撤销/重做与保存）。
+    event.stopPropagation();
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      this.closeShortcuts();
+      return;
+    }
+    // Tab 在对话框内循环，避免焦点跑到背后的编辑区。
+    if (event.key === 'Tab') this.trapFocus(event);
+  };
+
   private onKeyDown = (event: KeyboardEvent) => {
+    if (this.shortcutsOpen) return;
     const modifier = event.metaKey || event.ctrlKey;
     if (modifier && event.key.toLowerCase() === 'z') {
       event.preventDefault();
       event.shiftKey ? this.store.redo() : this.store.undo();
       return;
     }
-    if (modifier && event.key.toLowerCase() === 's') {
+    if (modifier && event.key.toLowerCase() === 'y') {
       event.preventDefault();
-      this.store.createSnapshot('键盘保存');
-      this.flash('已创建版本快照');
+      this.store.redo();
       return;
     }
-    if (modifier && event.key.toLowerCase() === 'k') {
+    // 输入说明文字时只有保存组合继续可用，其余快捷键不抢按键。
+    const editable = isEditableTarget(event.target);
+    for (const descriptor of SHORTCUT_DESCRIPTORS) {
+      if (editable && descriptor.action !== 'saveVersion') continue;
+      if (!eventMatchesBinding(event, this.shortcuts[descriptor.action])) continue;
       event.preventDefault();
-      this.renderRoot.querySelector<HTMLElement>('sp-search')?.focus();
+      this.runShortcut(descriptor.action);
       return;
-    }
-    if (event.altKey && event.key.toLowerCase() === 'n') {
-      event.preventDefault();
-      this.store.addComponent();
-      return;
-    }
-    const tabMap: Record<string, EditorTab> = { '1': 'overview', '2': 'api', '3': 'accessibility', '4': 'examples', '5': 'history' };
-    if (event.altKey && tabMap[event.key]) {
-      event.preventDefault();
-      this.tab = tabMap[event.key];
     }
   };
+
+  private runShortcut(action: ShortcutAction) {
+    switch (action) {
+      case 'focusSearch':
+        this.renderRoot.querySelector<HTMLElement>('sp-search')?.focus();
+        break;
+      case 'addComponent':
+        this.store.addComponent();
+        break;
+      case 'saveVersion':
+        this.store.createSnapshot('键盘保存');
+        this.flash('已创建版本快照');
+        break;
+      default:
+        if (TAB_BY_ACTION[action]) this.tab = TAB_BY_ACTION[action];
+    }
+  }
+
+  // ── 快捷键设置对话框 ───────────────────────────────────────────
+
+  private openShortcuts() {
+    this.lastFocusedElement = document.activeElement as HTMLElement | null;
+    this.draft = structuredClone(this.shortcuts);
+    this.rowError.clear();
+    this.recordingAction = null;
+    this.shortcutsOpen = true;
+    this.draftVersion += 1;
+    this.updateComplete.then(() => {
+      this.renderRoot.querySelector<HTMLElement>('.shortcut-dialog .btn-secondary')?.focus();
+    });
+  }
+
+  private closeShortcuts() {
+    this.shortcutsOpen = false;
+    this.recordingAction = null;
+    this.rowError.clear();
+    this.lastFocusedElement?.focus?.();
+  }
+
+  private startRecording(action: ShortcutAction) {
+    this.rowError.delete(action);
+    this.recordingAction = action;
+    this.draftVersion += 1;
+  }
+
+  private captureBinding(event: KeyboardEvent) {
+    const action = this.recordingAction;
+    if (!action) return;
+    const binding = bindingFromEvent(event);
+    // 仅按下修饰键时继续等待主键。
+    if (['Control', 'Meta', 'Alt', 'Shift'].includes(event.key)) return;
+    this.recordingAction = null;
+    const invalid = bindingProblem(binding);
+    if (invalid) {
+      this.rowError.set(action, { message: invalid, kind: 'invalid' });
+    } else {
+      const conflict = findConflict(binding, action, this.draft);
+      if (conflict) {
+        this.rowError.set(action, {
+          message: `与「${actionLabel(conflict)}」的 ${describeBinding(binding)} 冲突，已保留原设置`,
+          kind: 'conflict',
+          rejected: binding
+        });
+      } else {
+        this.draft[action] = binding;
+        this.rowError.delete(action);
+      }
+    }
+    this.revalidateConflictErrors();
+    this.draftVersion += 1;
+  }
+
+  private restoreRow(action: ShortcutAction) {
+    const descriptor = SHORTCUT_DESCRIPTORS.find((item) => item.action === action);
+    if (!descriptor) return;
+    this.recordingAction = null;
+    const binding = descriptor.defaultBinding;
+    const conflict = findConflict(binding, action, this.draft);
+    if (conflict) {
+      this.rowError.set(action, {
+        message: `默认组合 ${describeBinding(binding)} 与「${actionLabel(conflict)}」冲突，已保留原设置`,
+        kind: 'conflict',
+        rejected: { ...binding }
+      });
+    } else {
+      this.draft[action] = { ...binding };
+      this.rowError.delete(action);
+    }
+    this.revalidateConflictErrors();
+    this.draftVersion += 1;
+  }
+
+  private restoreAllDefaults() {
+    const next = Object.fromEntries(
+      SHORTCUT_DESCRIPTORS.map((descriptor) => [descriptor.action, { ...descriptor.defaultBinding }])
+    ) as ShortcutMap;
+    this.draft = next;
+    this.recordingAction = null;
+    // 默认键位彼此不冲突，所有冲突提示一并失效。
+    for (const [action, error] of this.rowError) {
+      if (error.kind === 'conflict') this.rowError.delete(action);
+    }
+    this.draftVersion += 1;
+  }
+
+  private saveShortcutSettings() {
+    this.shortcuts = this.draft;
+    saveShortcuts(this.shortcuts);
+    this.shortcutsOpen = false;
+    this.recordingAction = null;
+    this.rowError.clear();
+    this.lastFocusedElement?.focus?.();
+    this.flash('键位设置已保存并在本机生效');
+  }
+
+  /** 冲突源被改走后，清掉其他行上已失效的冲突提示。 */
+  private revalidateConflictErrors() {
+    for (const [action, error] of this.rowError) {
+      if (error.kind !== 'conflict' || !error.rejected) continue;
+      // 被拒绝的组合如今不再被任何其他命令占用时，提示即可消失。
+      if (!findConflict(error.rejected, action, this.draft)) this.rowError.delete(action);
+    }
+  }
+
+  private get draftChanged(): boolean {
+    return SHORTCUT_DESCRIPTORS.some(
+      (descriptor) => !sameBinding(this.draft[descriptor.action], this.shortcuts[descriptor.action])
+    );
+  }
+
+  private trapFocus(event: KeyboardEvent) {
+    const dialog = this.renderRoot.querySelector<HTMLElement>('.shortcut-dialog');
+    if (!dialog) return;
+    const focusable = dialog.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), [href], input:not([disabled]), [tabindex]:not([tabindex="-1"])'
+    );
+    if (!focusable.length) return;
+    const list = [...focusable];
+    const first = list[0];
+    const last = list[list.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
 
   protected render(): TemplateResult {
     const selected = this.store.selected;
@@ -198,12 +484,14 @@ export class SpecA11yWorkbench extends LitElement {
               <sp-search
                 placeholder="搜索组件、属性、键盘行为或示例"
                 aria-label="全文搜索"
+                aria-keyshortcuts=${ariaShortcut(this.shortcuts.focusSearch)}
                 .value=${this.query}
                 @input=${(event: Event) => { this.query = (event.currentTarget as HTMLInputElement & { value?: string }).value ?? ''; }}
               ></sp-search>
               <sp-button variant="secondary" ?disabled=${!this.store.canUndo} @click=${() => this.store.undo()}>撤销</sp-button>
               <sp-button variant="secondary" ?disabled=${!this.store.canRedo} @click=${() => this.store.redo()}>重做</sp-button>
-              <sp-button variant="accent" @click=${() => { this.store.createSnapshot('工具栏保存'); this.flash('版本已保存'); }}>保存版本</sp-button>
+              <sp-button variant="accent" aria-keyshortcuts=${ariaShortcut(this.shortcuts.saveVersion)} @click=${() => { this.store.createSnapshot('工具栏保存'); this.flash('版本已保存'); }}>保存版本</sp-button>
+              <sp-button variant="secondary" @click=${() => this.openShortcuts()}>键位设置</sp-button>
               <span class="save-state">本地自动保存 · ${selected?.revision ?? 0} 版</span>
             </div>
           </header>
@@ -211,7 +499,7 @@ export class SpecA11yWorkbench extends LitElement {
             <aside class="sidebar" aria-label="组件目录">
               <div class="sidebar-heading">
                 <h2>组件目录</h2>
-                <sp-action-button size="s" label="新建组件" @click=${() => this.store.addComponent()}>＋</sp-action-button>
+                <sp-action-button size="s" label="新建组件" aria-keyshortcuts=${ariaShortcut(this.shortcuts.addComponent)} @click=${() => this.store.addComponent()}>＋</sp-action-button>
               </div>
               <div class="component-list">
                 ${filtered.length ? repeat(filtered, (item) => item.id, (item) => html`
@@ -232,9 +520,77 @@ export class SpecA11yWorkbench extends LitElement {
             </aside>
           </div>
           ${this.toast ? html`<sp-toast open variant="positive" timeout="3000">${this.toast}</sp-toast>` : nothing}
-          <div class="footer-hint">⌘/Ctrl+Z 撤销 · ⇧⌘/Ctrl+Z 重做 · ⌘/Ctrl+K 搜索 · Alt+1–5 切换面板</div>
+          <div class="footer-hint">${this.footerHint}</div>
+          ${this.shortcutsOpen ? this.renderShortcutsDialog() : nothing}
         </div>
       </sp-theme>
+    `;
+  }
+
+  private get footerHint(): string {
+    const s = this.shortcuts;
+    const range = `${describeBinding(s.tabOverview, '1')}–${describeBinding(s.tabHistory, '5')}`;
+    return [
+      '⌘/Ctrl+Z 撤销',
+      '⇧⌘/Ctrl+Z 重做',
+      `${describeBinding(s.focusSearch)} 搜索`,
+      `${describeBinding(s.addComponent)} 新建`,
+      `${describeBinding(s.saveVersion)} 保存`,
+      `${range} 切换面板`
+    ].join(' · ');
+  }
+
+  private renderShortcutsDialog(): TemplateResult {
+    const globalDescriptors = SHORTCUT_DESCRIPTORS.filter((descriptor) => descriptor.group === 'global');
+    const tabDescriptors = SHORTCUT_DESCRIPTORS.filter((descriptor) => descriptor.group === 'tab');
+    const allDefault = SHORTCUT_DESCRIPTORS.every((descriptor) =>
+      sameBinding(this.draft[descriptor.action], descriptor.defaultBinding)
+    );
+    return html`
+      <div class="shortcut-overlay" @mousedown=${(event: MouseEvent) => { if (event.target === event.currentTarget) this.closeShortcuts(); }}>
+        <div class="shortcut-dialog" role="dialog" aria-modal="true" aria-labelledby="shortcut-dialog-title">
+          <div class="shortcut-dialog-head">
+            <div>
+              <h2 id="shortcut-dialog-title">键位设置</h2>
+              <p>点击某项后按下新的组合键。与浏览器保留键或其他命令冲突时会提示并保留原设置；保存后立即在本机生效。</p>
+            </div>
+            <button class="icon-btn" aria-label="关闭键位设置" @click=${() => this.closeShortcuts()}>×</button>
+          </div>
+          <div class="shortcut-group-title">全局命令</div>
+          ${globalDescriptors.map((descriptor) => this.renderShortcutRow(descriptor.action, descriptor.label))}
+          <div class="shortcut-group-title">五个编辑区</div>
+          ${tabDescriptors.map((descriptor) => this.renderShortcutRow(descriptor.action, descriptor.label))}
+          <div class="shortcut-dialog-foot">
+            <button class="btn-secondary" @click=${() => this.restoreAllDefaults()} ?disabled=${allDefault}>全部恢复默认</button>
+            <span class="shortcut-spacer"></span>
+            <button class="btn-secondary" @click=${() => this.closeShortcuts()}>取消</button>
+            <button class="btn-primary" @click=${() => this.saveShortcutSettings()} ?disabled=${!this.draftChanged}>保存设置</button>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  private renderShortcutRow(action: ShortcutAction, label: string): TemplateResult {
+    const binding = this.draft[action];
+    const descriptor = SHORTCUT_DESCRIPTORS.find((item) => item.action === action);
+    const isDefault = descriptor ? sameBinding(binding, descriptor.defaultBinding) : false;
+    const recording = this.recordingAction === action;
+    const error = this.rowError.get(action);
+    return html`
+      <div class="shortcut-row ${recording ? 'recording' : ''}">
+        <span class="shortcut-name">${label}</span>
+        ${error ? html`<span class="shortcut-error" role="alert">${error.message}</span>` : nothing}
+        <span class="shortcut-row-actions">
+          <button
+            class="shortcut-key"
+            aria-pressed=${recording}
+            aria-label=${`${label}快捷键，当前为 ${describeBinding(binding)}，点击后按新组合`}
+            @click=${() => this.startRecording(action)}
+          >${recording ? '请按下新组合（Esc 取消）…' : describeBinding(binding)}</button>
+          <button class="btn-link" ?disabled=${isDefault || recording} @click=${() => this.restoreRow(action)}>恢复默认</button>
+        </span>
+      </div>
     `;
   }
 
@@ -256,11 +612,11 @@ export class SpecA11yWorkbench extends LitElement {
         </div>
       </div>
       <div class="tabs" role="tablist" aria-label="编辑区域">
-        ${this.renderTab('overview', '1 概述')}
-        ${this.renderTab('api', '2 属性与状态')}
-        ${this.renderTab('accessibility', '3 无障碍')}
-        ${this.renderTab('examples', '4 示例')}
-        ${this.renderTab('history', '5 版本')}
+        ${this.renderTab('overview', '概述')}
+        ${this.renderTab('api', '属性与状态')}
+        ${this.renderTab('accessibility', '无障碍')}
+        ${this.renderTab('examples', '示例')}
+        ${this.renderTab('history', '版本')}
       </div>
       ${this.tab === 'overview' ? this.renderOverview(component) : nothing}
       ${this.tab === 'api' ? this.renderApi(component) : nothing}
@@ -271,7 +627,15 @@ export class SpecA11yWorkbench extends LitElement {
   }
 
   private renderTab(tab: EditorTab, label: string): TemplateResult {
-    return html`<button class="tab" role="tab" aria-selected=${this.tab === tab} @click=${() => { this.tab = tab; }}>${label}</button>`;
+    const action = TAB_ACTIONS.find((item) => TAB_BY_ACTION[item] === tab);
+    const binding = action ? this.shortcuts[action] : undefined;
+    return html`<button
+      class="tab"
+      role="tab"
+      aria-selected=${this.tab === tab}
+      aria-keyshortcuts=${binding ? ariaShortcut(binding) : nothing}
+      @click=${() => { this.tab = tab; }}
+    ><span class="tab-label">${label}</span>${binding ? html`<kbd>${describeBinding(binding)}</kbd>` : nothing}</button>`;
   }
 
   private renderOverview(component: ComponentSpec): TemplateResult {
